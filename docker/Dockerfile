@@ -20,8 +20,8 @@ RUN npm run build \
 
 FROM alpine:3.21 AS xray
 
-ARG XRAY_CORE_VERSION=v26.7.28
-ARG UPSTREAM_REPO=XTLS
+ARG XRAY_CORE_VERSION=v26.7.28-custom.1
+ARG UPSTREAM_REPO=raaad1on
 ARG TARGETARCH
 
 RUN apk add --no-cache curl \
