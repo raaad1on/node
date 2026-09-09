@@ -1,20 +1,77 @@
 name: Build & Push Docker Image
 
+# Tag format: {node}-x{xray}  e.g. 3.4.1-x26.9.9
+# Also tags: latest, {node}, x{xray}
 on:
   push:
     tags:
-      - '*'
+      - '*-x*'
   workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Remnanode version (empty = latest remnawave/node release)'
+        required: false
+        default: ''
+      xray_version:
+        description: 'Xray version without v prefix (empty = latest XTLS/Xray-core release)'
+        required: false
+        default: ''
 
 jobs:
-  variants:
-    name: Resolve variants
+  resolve:
+    name: Resolve versions
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.versions.outputs.tag }}
+      node_version: ${{ steps.versions.outputs.node_version }}
+      xray_version: ${{ steps.versions.outputs.xray_version }}
+      xray_tag: ${{ steps.versions.outputs.xray_tag }}
       list: ${{ steps.bake.outputs.list }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve node + xray versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            REF="${{ github.ref_name }}"
+            # Accept 3.4.1-x26.9.9 or v3.4.1-x26.9.9
+            REF="${REF#v}"
+            if [[ ! "$REF" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-x([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "Tag must match NODE-xXRAY, e.g. 3.4.1-x26.9.9 (got: ${{ github.ref_name }})"
+              exit 1
+            fi
+            NODE="${BASH_REMATCH[1]}"
+            XRAY="${BASH_REMATCH[2]}"
+          else
+            NODE="${{ inputs.node_version }}"
+            XRAY="${{ inputs.xray_version }}"
+
+            if [[ -z "$NODE" ]]; then
+              NODE=$(gh release view --repo remnawave/node --json tagName -q .tagName)
+              NODE="${NODE#v}"
+            fi
+            if [[ -z "$XRAY" ]]; then
+              # Prefer latest release tag from XTLS (includes pre-releases via release list)
+              XRAY=$(gh release list --repo XTLS/Xray-core --limit 1 --json tagName -q '.[0].tagName')
+              XRAY="${XRAY#v}"
+            fi
+          fi
+
+          TAG="${NODE}-x${XRAY}"
+          XRAY_TAG="v${XRAY}"
+
+          echo "node_version=$NODE" >> "$GITHUB_OUTPUT"
+          echo "xray_version=$XRAY" >> "$GITHUB_OUTPUT"
+          echo "xray_tag=$XRAY_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved: remnanode=$NODE  xray=$XRAY_TAG  image_tag=$TAG"
 
       - name: Read variants from docker-bake.hcl
         id: bake
@@ -25,7 +82,7 @@ jobs:
 
   build-docker-images:
     name: Build ${{ matrix.variant }} ${{ matrix.platform }}
-    needs: [variants]
+    needs: [resolve]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -34,7 +91,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: [linux/amd64, linux/arm64]
-        variant: ${{ fromJson(needs.variants.outputs.list) }}
+        variant: ${{ fromJson(needs.resolve.outputs.list) }}
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -60,10 +117,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
+        env:
+          XRAY_CORE_VERSION: ${{ needs.resolve.outputs.xray_tag }}
+          UPSTREAM_REPO: XTLS
         run: |
           docker buildx bake "${{ matrix.variant }}" \
             --set "*.platform=${{ matrix.platform }}" \
             --set "*.tags=" \
+            --set "*.args.XRAY_CORE_VERSION=${XRAY_CORE_VERSION}" \
+            --set "*.args.UPSTREAM_REPO=${UPSTREAM_REPO}" \
             --set '*.output=type=image,"name=ghcr.io/raaad1on/remnanode",push-by-digest=true,name-canonical=true,push=true' \
             --metadata-file "${{ runner.temp }}/metadata.json"
 
@@ -83,7 +145,7 @@ jobs:
 
   merge:
     name: Merge & push manifests (${{ matrix.variant }})
-    needs: [variants, build-docker-images]
+    needs: [resolve, build-docker-images]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -91,7 +153,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJson(needs.variants.outputs.list) }}
+        variant: ${{ fromJson(needs.resolve.outputs.list) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,27 +177,24 @@ jobs:
 
       - name: Create & push manifest lists
         working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
+          NODE_VERSION: ${{ needs.resolve.outputs.node_version }}
+          XRAY_VERSION: ${{ needs.resolve.outputs.xray_version }}
         run: |
-          resolve() {
-            TAG="$1" docker buildx bake --file "$GITHUB_WORKSPACE/docker-bake.hcl" \
-              --print "${{ matrix.variant }}" 2>/dev/null \
-              | jq -r --arg reg "$2:" '.target[].tags[] | select(startswith($reg))'
-          }
-
           registry="ghcr.io/raaad1on/remnanode"
-          tags=$( { resolve latest "$registry"; resolve "${{ github.ref_name }}" "$registry"; } \
-            | sed 's/^/-t /' | tr '\n' ' ')
+          tags="-t ${registry}:${IMAGE_TAG} -t ${registry}:latest -t ${registry}:${NODE_VERSION} -t ${registry}:x${XRAY_VERSION}"
 
-          echo "→ $registry: $tags"
+          echo "→ $registry tags: $IMAGE_TAG latest ${NODE_VERSION} x${XRAY_VERSION}"
 
           docker buildx imagetools create $tags \
             $(for digest in *; do echo "$registry@sha256:$digest"; done)
 
       - name: Inspect image
-        run: docker buildx imagetools inspect $(TAG=${{ github.ref_name }} docker buildx bake --print "${{ matrix.variant }}" 2>/dev/null | jq -r '.target[].tags[0]')
+        run: docker buildx imagetools inspect ghcr.io/raaad1on/remnanode:${{ needs.resolve.outputs.tag }}
 
   create-release:
-    needs: [merge]
+    needs: [resolve, merge]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -148,34 +207,36 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref_name }}
-          name: v${{ github.ref_name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: remnanode ${{ needs.resolve.outputs.node_version }} + Xray ${{ needs.resolve.outputs.xray_tag }}
           generate_release_notes: true
           make_latest: true
           body: |
-            ## Custom Remnanode with Xray Blackhole Status Code
+            ## Remnanode + official Xray
 
-            Docker image with custom Xray build that supports `statusCode` in blackhole protocol.
+            - **Remnanode:** `${{ needs.resolve.outputs.node_version }}` (upstream remnawave/node)
+            - **Xray-core:** `${{ needs.resolve.outputs.xray_tag }}` (official XTLS/Xray-core)
 
             ### Docker Image
             ```bash
-            docker pull ghcr.io/raaad1on/remnanode:${{ github.ref_name }}
-            # or latest
-            docker pull ghcr.io/raaad1on/remnanode:latest
+            docker pull ghcr.io/raaad1on/remnanode:${{ needs.resolve.outputs.tag }}
+            # also tagged:
+            #   ghcr.io/raaad1on/remnanode:latest
+            #   ghcr.io/raaad1on/remnanode:${{ needs.resolve.outputs.node_version }}
+            #   ghcr.io/raaad1on/remnanode:x${{ needs.resolve.outputs.xray_version }}
             ```
 
-            ### Usage Example
+            ### Blackhole 204 (official API since Xray with #6713)
             ```json
             {
-              "outbounds": [{
-                "tag": "204",
-                "protocol": "blackhole",
-                "settings": {
-                  "response": {
-                    "type": "http",
-                    "statusCode": 204
-                  }
+              "tag": "204",
+              "protocol": "blackhole",
+              "settings": {
+                "response": {
+                  "type": "custom",
+                  "customResponseData": "SFRUUC8xLjEgMjA0IE5vIENvbnRlbnQNCkNvbm5lY3Rpb246IGNsb3NlDQoNCg=="
                 }
-              }]
+              }
             }
             ```
+            (`customResponseData` is base64 of `HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n`)

@@ -20,8 +20,8 @@ RUN npm run build \
 
 FROM alpine:3.21 AS xray
 
-ARG XRAY_CORE_VERSION=v26.7.28-custom.1
-ARG UPSTREAM_REPO=raaad1on
+ARG XRAY_CORE_VERSION=v26.9.9
+ARG UPSTREAM_REPO=XTLS
 ARG TARGETARCH
 
 RUN apk add --no-cache curl \
@@ -79,11 +79,11 @@ FROM node:24.20-trixie-slim
 
 ARG S6_OVERLAY_VERSION=3.2.3.2
 
-LABEL org.opencontainers.image.title="Remnawave Node"
-LABEL org.opencontainers.image.description="Remnawave Node with built-in XRay Core"
-LABEL org.opencontainers.image.url="https://github.com/remnawave/node"
-LABEL org.opencontainers.image.source="https://github.com/remnawave/node"
-LABEL org.opencontainers.image.vendor="Remnawave"
+LABEL org.opencontainers.image.title="Remnawave Node (official Xray)"
+LABEL org.opencontainers.image.description="Remnawave Node built with a pinned official XTLS/Xray-core release"
+LABEL org.opencontainers.image.url="https://github.com/raaad1on/node"
+LABEL org.opencontainers.image.source="https://github.com/raaad1on/node"
+LABEL org.opencontainers.image.vendor="raaad1on"
 LABEL org.opencontainers.image.licenses="AGPL-3.0"
 LABEL org.opencontainers.image.documentation="https://docs.rw"
 
